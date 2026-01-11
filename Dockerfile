@@ -29,7 +29,7 @@ COPY --from=builder /app/target/release/yurecollect /usr/local/bin/yurecollect
 EXPOSE 3000
 ENV RUST_LOG=info
 # Optionally set WS_URL via environment or pass as arg
-ENV WS_URL=""
+ENV WS_URL="wss://unstable.kusaremkn.com/yure/"
 
 USER appuser
 ENTRYPOINT ["/usr/local/bin/yurecollect"]
