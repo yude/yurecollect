@@ -190,14 +190,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
         header { padding: 12px 16px; border-bottom: 1px solid #8884; display:flex; gap:12px; align-items:center; }
         main { padding: 12px 16px; display: grid; gap: 16px; }
         #chart { width: 100%; height: 320px; }
-        #list { display: grid; gap: 8px; }
-        .item { padding: 8px; border: 1px solid #8884; border-radius: 6px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
+        #log { display: grid; gap: 6px; height: 40em; overflow-y: auto; }
+        .item { padding: 6px 8px; border: 1px solid #8884; border-radius: 6px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
         .meta { color: #888; font-size: 12px; }
     </style>
     <script src="https://unpkg.com/uplot@1.6.27/dist/uPlot.iife.min.js"></script>
     <script>
         async function boot() {
-            const listEl = document.getElementById('list');
+            let logEl = document.getElementById('log');
             let chartEl = document.getElementById('chart');
             if (!chartEl) {
                 // Fallback: create chart container if missing
@@ -208,7 +208,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
                 const mainEl = document.querySelector('main') || document.body;
                 mainEl.prepend(chartEl);
             }
-            let total = 0;
+            if (!logEl) {
+                const mainEl = document.querySelector('main') || document.body;
+                logEl = document.createElement('div');
+                logEl.id = 'log';
+                mainEl.append(logEl);
+            }
+            // logs: newest at top, keep latest ~10 lines
 
             // uPlot data buffers
             const tArr = [];  // timestamps (ms)
@@ -216,12 +222,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
             const ayArr = [];
             const azArr = [];
             const MAX_POINTS = 20000;
+            const UPDATE_INTERVAL_MS = 100; // throttle graph updates
+            let updateScheduled = false;
+
+            function scheduleUpdate() {
+                if (!updateScheduled) {
+                    updateScheduled = true;
+                    setTimeout(() => {
+                        updateScheduled = false;
+                        u.setData([tArr, axArr, ayArr, azArr]);
+                    }, UPDATE_INTERVAL_MS);
+                }
+            }
 
             const opts = {
                 title: 'Acceleration',
                 width: chartEl.clientWidth || window.innerWidth,
                 height: chartEl.clientHeight || 320,
-                scales: { x: { time: true } },
+                scales: { x: { time: true }, y: { range: [-2.0, 2.0] } },
                 axes: [
                     { grid: { show: true } },
                     { grid: { show: true }, label: 'acc' },
@@ -252,7 +270,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
                 ayArr.push(toNum(y));
                 azArr.push(toNum(z));
                 while (tArr.length > MAX_POINTS) { tArr.shift(); axArr.shift(); ayArr.shift(); azArr.shift(); }
-                u.setData([tArr, axArr, ayArr, azArr]);
+                scheduleUpdate();
             }
 
             // Initial fetch of recent messages
@@ -260,17 +278,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
                 const res = await fetch('/api/messages?limit=500');
                 const arr = await res.json();
                 arr.forEach(addItem);
-                total += arr.length;
             } catch (e) { console.error(e); }
 
             // Live updates via WebSocket
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
             const ws = new WebSocket(proto + '://' + location.host + '/ws');
             ws.onmessage = (ev) => {
-                try {
-                    addItem(ev.data);
-                    total += 1;
-                } catch (e) { console.error(e); }
+                try { addItem(ev.data); } catch (e) { console.error(e); }
             };
 
             function addItem(text) {
@@ -284,6 +298,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
                             const y = item.y ?? item.ay ?? item.accelerationY ?? item.acceleration?.y ?? null;
                             const z = item.z ?? item.az ?? item.accelerationZ ?? item.acceleration?.z ?? null;
                             pushData(t, x, y, z);
+                            prependLog(JSON.stringify(item));
                         }
                         return;
                     } else if (parsed && typeof parsed === 'object') {
@@ -292,17 +307,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
                         const y = parsed.y ?? parsed.ay ?? parsed.accelerationY ?? parsed.acceleration?.y ?? null;
                         const z = parsed.z ?? parsed.az ?? parsed.accelerationZ ?? parsed.acceleration?.z ?? null;
                         pushData(t, x, y, z);
+                        prependLog(JSON.stringify(parsed));
                         return;
                     }
                 } catch {}
+                prependLog(text);
             }
 
-            function appendTile(content) {
+            function prependLog(content) {
                 const el = document.createElement('div');
                 el.className = 'item';
                 el.textContent = content;
-                // Scroll to bottom when new content arrives
-                window.scrollTo({ top: document.body.scrollHeight });
+                // newest at top
+                logEl.insertBefore(el, logEl.firstChild);
+                // keep only latest ~10 lines
+                while (logEl.childNodes.length > 10) {
+                    logEl.removeChild(logEl.lastChild);
+                }
             }
         }
         addEventListener('DOMContentLoaded', boot);
@@ -313,6 +334,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <h1 style="margin: 0">yurecollect</h1>
         </header>
         <main>
+            <div id="chart"></div>
+            <div id="log" aria-label="recent logs" style="margin-top: 5em;"></div>
         </main>
     </body>
     </html>"#;
