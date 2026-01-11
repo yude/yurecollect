@@ -66,30 +66,8 @@ WS_URL=wss://example.com/your/ws cargo run --release
 
 ## メモリ保持について
 
-- 既定値は約 3GB（`MAX_BUFFER_BYTES`）です。調整したい場合は [src/main.rs](src/main.rs) の定数を変更してください。
+- 既定値は約 1 GB（`MAX_BUFFER_BYTES`）です。調整したい場合は [src/main.rs](src/main.rs) の定数を変更してください。
 - 上限を超える場合は古いメッセージから破棄して空き領域を確保します。
-
-## Docker で利用
-
-ローカルビルド:
-
-```bash
-docker build -t ghcr.io/yude/yurecollect .
-```
-
-実行例（引数指定 or 環境変数指定）:
-
-```bash
-docker run --rm -p 3000:3000 ghcr.io/<OWNER>/<REPO>:local wss://unstable.kusaremkn.com/yure/
-
-docker run --rm -p 3000:3000 -e WS_URL=wss://unstable.kusaremkn.com/yure/ ghcr.io/<OWNER>/<REPO>:local
-```
-
-## GitHub Actions / GHCR（マルチアーキテクチャ）
-
-- push や tag（`v*`）で、`linux/amd64, linux/arm64` のマルチアーチイメージを GHCR に公開します。
-- ワークフロー: [.github/workflows/docker.yml](.github/workflows/docker.yml)
-- 取得先: `ghcr.io/<OWNER>/<REPO>:latest` やタグ固有の参照
 
 ## トラブルシューティングのヒント
 
