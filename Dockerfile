@@ -4,13 +4,8 @@
 FROM rust:1.88-trixie AS builder
 WORKDIR /app
 
-# Cache dependencies
-COPY Cargo.toml Cargo.lock* ./
-RUN mkdir -p src && echo "fn main(){}" > src/main.rs && \
-    cargo build --release || true
-
 # Copy sources
-COPY src ./src
+COPY . /app
 
 # Build release binary
 RUN cargo build --release
