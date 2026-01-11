@@ -23,3 +23,9 @@ WS_URL=ws://localhost:8080/ws cargo run --release
 - Prints each text frame to stdout.
 - Stores raw messages in an in-memory buffer up to ~1GB, evicting oldest when full.
 - Attempts to parse JSON (`serde_json::Value`); parse errors are logged to stderr but do not stop the program.
+
+## Web Frontend
+
+- When running, a local web UI is served at `http://localhost:3000/`.
+- It loads the latest messages via `GET /api/messages?limit=500` and subscribes to live updates via `WS /ws`.
+- If upstream frames contain JSON arrays, the UI expands them for readability.

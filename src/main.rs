@@ -1,11 +1,22 @@
 use std::collections::VecDeque;
 use std::env;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
+use axum::{
+    extract::{Query, State},
+    response::{Html, IntoResponse},
+    routing::{get},
+    Router,
+};
+use axum::extract::ws::{Message as WsMessage, WebSocketUpgrade};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::connect_async;
 
-const MAX_BUFFER_BYTES: usize = 1024 * 1024 * 1024; // 1GB
+const MAX_BUFFER_BYTES: usize = 1024 * 1024 * 1024 * 3; // 3GB
 
 struct MessageBuffer {
     total_bytes: usize,
@@ -22,7 +33,6 @@ impl MessageBuffer {
 
     fn push(&mut self, msg: String) {
         let msg_len = msg.len();
-        // Evict oldest messages until we have space for the new one
         while self.total_bytes + msg_len > MAX_BUFFER_BYTES {
             if let Some(front) = self.entries.pop_front() {
                 self.total_bytes = self.total_bytes.saturating_sub(front.len());
@@ -33,29 +43,59 @@ impl MessageBuffer {
         self.total_bytes += msg_len;
         self.entries.push_back(msg);
     }
+
+    fn len(&self) -> usize { self.entries.len() }
+    fn iter(&self) -> impl DoubleEndedIterator<Item=&String> { self.entries.iter() }
 }
+
+#[derive(Clone)]
+struct AppState {
+    buffer: Arc<RwLock<MessageBuffer>>,
+    tx: broadcast::Sender<String>,
+}
+
+#[derive(Deserialize)]
+struct ListParams { limit: Option<usize> }
 
 #[tokio::main]
 async fn main() {
     // Get WebSocket URL from CLI arg or env var
     let url = env::args().nth(1).or_else(|| env::var("WS_URL").ok());
-
     let Some(url) = url else {
         eprintln!("Usage: yurecollect <ws-url>\nAlternatively set WS_URL env var.");
         std::process::exit(2);
     };
 
+    let state = AppState {
+        buffer: Arc::new(RwLock::new(MessageBuffer::new())),
+        tx: broadcast::channel(1024).0,
+    };
+
+    // Spawn HTTP server for web UI
+    let state_for_http = state.clone();
+    let http_task = tokio::spawn(async move {
+        run_http_server(state_for_http).await;
+    });
+
+    // Connect to upstream websocket and stream messages
+    let state_for_ws = state.clone();
+    let ws_task = tokio::spawn(async move {
+        run_upstream_ws(url, state_for_ws).await;
+    });
+
+    let _ = tokio::join!(http_task, ws_task);
+}
+
+async fn run_upstream_ws(url: String, state: AppState) {
     let (ws_stream, _resp) = match connect_async(&url).await {
         Ok(pair) => pair,
         Err(err) => {
             eprintln!("Failed to connect to {}: {}", url, err);
-            std::process::exit(1);
+            return;
         }
     };
 
     let (_write, mut read) = ws_stream.split();
-
-    let mut buffer = MessageBuffer::new();
 
     while let Some(item) = read.next().await {
         match item {
@@ -67,19 +107,28 @@ async fn main() {
                     println!("{}", text);
 
                     // Store message in in-memory buffer capped at ~1GB
-                    buffer.push(text.clone());
+                    {
+                        let mut buf = state.buffer.write().await;
+                        buf.push(text.clone());
+                    }
 
-                    // Try to parse JSON (array or object) just to "read" it
-                    // Parsing errors won't stop the program
+                    // Publish to subscribers
+                    let _ = state.tx.send(text.clone());
+
+                    // Try to parse JSON to validate
                     let _ = serde_json::from_str::<Value>(&text).map_err(|e| {
                         eprintln!("JSON parse error: {}", e);
                     });
                 } else if msg.is_binary() {
                     let bin = msg.into_data();
                     println!("<binary message: {} bytes>", bin.len());
-                    buffer.push(format!("<binary {} bytes>", bin.len()));
+                    {
+                        let mut buf = state.buffer.write().await;
+                        buf.push(format!("<binary {} bytes>", bin.len()));
+                    }
+                    let _ = state.tx.send(format!("<binary {} bytes>", bin.len()));
                 } else {
-                    // Other message types (ping/pong/close) are ignored here
+                    // ignore
                 }
             }
             Err(err) => {
@@ -89,3 +138,181 @@ async fn main() {
         }
     }
 }
+
+async fn run_http_server(state: AppState) {
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/api/messages", get(list_messages))
+        .route("/ws", get(ws_handler))
+        .with_state(state);
+
+    let addr: SocketAddr = ([0, 0, 0, 0], 3000).into();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    println!("Web UI available at http://{}/", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn index() -> impl IntoResponse {
+    Html(INDEX_HTML)
+}
+
+async fn list_messages(State(state): State<AppState>, Query(p): Query<ListParams>) -> impl IntoResponse {
+    let limit = p.limit.unwrap_or(500);
+    let buf = state.buffer.read().await;
+    let total = buf.len();
+    let start = total.saturating_sub(limit);
+    let slice: Vec<String> = buf.iter().skip(start).cloned().collect();
+    axum::Json(slice)
+}
+
+async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |mut socket| async move {
+        let mut rx = state.tx.subscribe();
+        while let Ok(msg) = rx.recv().await {
+            if socket.send(WsMessage::Text(msg)).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+// Simple embedded HTML for the frontend
+const INDEX_HTML: &str = r#"<!doctype html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>yurecollect</title>
+    <link rel="stylesheet" href="https://unpkg.com/uplot@1.6.27/dist/uPlot.min.css" />
+    <style>
+        :root { color-scheme: light dark; }
+        body { font-family: system-ui, sans-serif; margin: 0; }
+        header { padding: 12px 16px; border-bottom: 1px solid #8884; display:flex; gap:12px; align-items:center; }
+        main { padding: 12px 16px; display: grid; gap: 16px; }
+        #chart { width: 100%; height: 320px; }
+        #list { display: grid; gap: 8px; }
+        .item { padding: 8px; border: 1px solid #8884; border-radius: 6px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
+        .meta { color: #888; font-size: 12px; }
+    </style>
+    <script src="https://unpkg.com/uplot@1.6.27/dist/uPlot.iife.min.js"></script>
+    <script>
+        async function boot() {
+            const listEl = document.getElementById('list');
+            let chartEl = document.getElementById('chart');
+            if (!chartEl) {
+                // Fallback: create chart container if missing
+                chartEl = document.createElement('div');
+                chartEl.id = 'chart';
+                chartEl.style.width = '100%';
+                chartEl.style.height = '320px';
+                const mainEl = document.querySelector('main') || document.body;
+                mainEl.prepend(chartEl);
+            }
+            let total = 0;
+
+            // uPlot data buffers
+            const tArr = [];  // timestamps (ms)
+            const axArr = [];
+            const ayArr = [];
+            const azArr = [];
+            const MAX_POINTS = 20000;
+
+            const opts = {
+                title: 'Acceleration',
+                width: chartEl.clientWidth || window.innerWidth,
+                height: chartEl.clientHeight || 320,
+                scales: { x: { time: true } },
+                axes: [
+                    { grid: { show: true } },
+                    { grid: { show: true }, label: 'acc' },
+                ],
+                series: [
+                    {},
+                    { label: 'ax', stroke: 'red' },
+                    { label: 'ay', stroke: 'green' },
+                    { label: 'az', stroke: 'blue' },
+                ],
+            };
+            const u = new uPlot(opts, [tArr, axArr, ayArr, azArr], chartEl);
+
+            // Resize handling
+            addEventListener('resize', () => {
+                u.setSize({ width: chartEl.clientWidth, height: chartEl.clientHeight || 320 });
+            });
+
+            function toNum(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+            function toTsSeconds(t) {
+                const ms = Number(t);
+                return Number.isFinite(ms) ? (ms / 1000) : (Date.now() / 1000);
+            }
+
+            function pushData(t, x, y, z) {
+                tArr.push(toTsSeconds(t));
+                axArr.push(toNum(x));
+                ayArr.push(toNum(y));
+                azArr.push(toNum(z));
+                while (tArr.length > MAX_POINTS) { tArr.shift(); axArr.shift(); ayArr.shift(); azArr.shift(); }
+                u.setData([tArr, axArr, ayArr, azArr]);
+            }
+
+            // Initial fetch of recent messages
+            try {
+                const res = await fetch('/api/messages?limit=500');
+                const arr = await res.json();
+                arr.forEach(addItem);
+                total += arr.length;
+            } catch (e) { console.error(e); }
+
+            // Live updates via WebSocket
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const ws = new WebSocket(proto + '://' + location.host + '/ws');
+            ws.onmessage = (ev) => {
+                try {
+                    addItem(ev.data);
+                    total += 1;
+                } catch (e) { console.error(e); }
+            };
+
+            function addItem(text) {
+                // If message is JSON array, expand into multiple tiles and update chart
+                try {
+                    const parsed = JSON.parse(text);
+                    if (Array.isArray(parsed)) {
+                        for (const item of parsed) {
+                            const t = item.t ?? item.time ?? Date.now();
+                            const x = item.x ?? item.ax ?? item.accelerationX ?? item.acceleration?.x ?? null;
+                            const y = item.y ?? item.ay ?? item.accelerationY ?? item.acceleration?.y ?? null;
+                            const z = item.z ?? item.az ?? item.accelerationZ ?? item.acceleration?.z ?? null;
+                            pushData(t, x, y, z);
+                        }
+                        return;
+                    } else if (parsed && typeof parsed === 'object') {
+                        const t = parsed.t ?? parsed.time ?? Date.now();
+                        const x = parsed.x ?? parsed.ax ?? parsed.accelerationX ?? parsed.acceleration?.x ?? null;
+                        const y = parsed.y ?? parsed.ay ?? parsed.accelerationY ?? parsed.acceleration?.y ?? null;
+                        const z = parsed.z ?? parsed.az ?? parsed.accelerationZ ?? parsed.acceleration?.z ?? null;
+                        pushData(t, x, y, z);
+                        return;
+                    }
+                } catch {}
+            }
+
+            function appendTile(content) {
+                const el = document.createElement('div');
+                el.className = 'item';
+                el.textContent = content;
+                // Scroll to bottom when new content arrives
+                window.scrollTo({ top: document.body.scrollHeight });
+            }
+        }
+        addEventListener('DOMContentLoaded', boot);
+    </script>
+    </head>
+    <body>
+        <header>
+            <h1 style="margin: 0">yurecollect</h1>
+        </header>
+        <main>
+        </main>
+    </body>
+    </html>"#;
