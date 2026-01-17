@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, RwLock};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 
 const MAX_BUFFER_BYTES: usize = 1024 * 1024 * 1024 * 1; // 1GB
@@ -73,69 +74,106 @@ async fn main() {
 
     // Spawn HTTP server for web UI
     let state_for_http = state.clone();
-    let http_task = tokio::spawn(async move {
+    let mut http_task = tokio::spawn(async move {
         run_http_server(state_for_http).await;
     });
 
     // Connect to upstream websocket and stream messages
     let state_for_ws = state.clone();
-    let ws_task = tokio::spawn(async move {
+    let mut ws_task = tokio::spawn(async move {
         run_upstream_ws(url, state_for_ws).await;
     });
 
-    let _ = tokio::join!(http_task, ws_task);
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("Received Ctrl+C, shutting down...");
+            http_task.abort();
+            ws_task.abort();
+        }
+        _ = &mut http_task => {
+            eprintln!("HTTP task ended, shutting down...");
+            ws_task.abort();
+        }
+        _ = &mut ws_task => {
+            eprintln!("Upstream task ended, shutting down...");
+            http_task.abort();
+        }
+    }
 }
 
 async fn run_upstream_ws(url: String, state: AppState) {
-    let (ws_stream, _resp) = match connect_async(&url).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            eprintln!("Failed to connect to {}: {}", url, err);
-            return;
-        }
-    };
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
 
-    let (_write, mut read) = ws_stream.split();
-
-    while let Some(item) = read.next().await {
-        match item {
-            Ok(msg) => {
-                if msg.is_text() {
-                    let text = msg.into_text().unwrap_or_default();
-
-                    // Print raw message to stdout
-                    println!("{}", text);
-
-                    // Store message in in-memory buffer capped at ~1GB
-                    {
-                        let mut buf = state.buffer.write().await;
-                        buf.push(text.clone());
-                    }
-
-                    // Publish to subscribers
-                    let _ = state.tx.send(text.clone());
-
-                    // Try to parse JSON to validate
-                    let _ = serde_json::from_str::<Value>(&text).map_err(|e| {
-                        eprintln!("JSON parse error: {}", e);
-                    });
-                } else if msg.is_binary() {
-                    let bin = msg.into_data();
-                    println!("<binary message: {} bytes>", bin.len());
-                    {
-                        let mut buf = state.buffer.write().await;
-                        buf.push(format!("<binary {} bytes>", bin.len()));
-                    }
-                    let _ = state.tx.send(format!("<binary {} bytes>", bin.len()));
-                } else {
-                    // ignore
-                }
+    loop {
+        let (ws_stream, _resp) = match connect_async(&url).await {
+            Ok(pair) => {
+                eprintln!("Connected to upstream: {}", url);
+                backoff = Duration::from_secs(1);
+                pair
             }
             Err(err) => {
-                eprintln!("WebSocket read error: {}", err);
-                break;
+                eprintln!(
+                    "Failed to connect to {}: {} (retry in {:?})",
+                    url, err, backoff
+                );
+                sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+                continue;
+            }
+        };
+
+        let (_write, mut read) = ws_stream.split();
+
+        while let Some(item) = read.next().await {
+            match item {
+                Ok(msg) => {
+                    if msg.is_text() {
+                        let text = msg.into_text().unwrap_or_default();
+
+                        // Print raw message to stdout
+                        println!("{}", text);
+
+                        // Store message in in-memory buffer capped at ~1GB
+                        {
+                            let mut buf = state.buffer.write().await;
+                            buf.push(text.clone());
+                        }
+
+                        // Publish to subscribers
+                        let _ = state.tx.send(text.clone());
+
+                        // Try to parse JSON to validate
+                        let _ = serde_json::from_str::<Value>(&text).map_err(|e| {
+                            eprintln!("JSON parse error: {}", e);
+                        });
+                    } else if msg.is_binary() {
+                        let bin = msg.into_data();
+                        println!("<binary message: {} bytes>", bin.len());
+                        {
+                            let mut buf = state.buffer.write().await;
+                            buf.push(format!("<binary {} bytes>", bin.len()));
+                        }
+                        let _ = state.tx.send(format!("<binary {} bytes>", bin.len()));
+                    } else if msg.is_close() {
+                        eprintln!("Upstream WebSocket closed. reconnecting...");
+                        break;
+                    } else {
+                        // ignore
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "WebSocket read error: {} (reconnect in {:?})",
+                        err, backoff
+                    );
+                    break;
+                }
             }
         }
+
+        sleep(backoff).await;
+        backoff = std::cmp::min(backoff * 2, max_backoff);
     }
 }
 
@@ -345,10 +383,60 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
             // Live updates via WebSocket
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-            const ws = new WebSocket(proto + '://' + location.host + '/ws');
-            ws.onmessage = (ev) => {
-                try { addItem(ev.data); } catch (e) { console.error(e); }
-            };
+            const wsUrl = proto + '://' + location.host + '/ws';
+            let ws = null;
+            let reconnectTimer = null;
+            let reconnectDelayMs = 500;
+            const reconnectDelayMaxMs = 30_000;
+            let manuallyClosed = false;
+
+            function scheduleReconnect() {
+                if (manuallyClosed) return;
+                if (reconnectTimer != null) return;
+                const delay = reconnectDelayMs;
+                reconnectDelayMs = Math.min(reconnectDelayMs * 2, reconnectDelayMaxMs);
+                console.warn(`ws disconnected; retry in ${delay}ms`);
+                reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+                    connectWs();
+                }, delay);
+            }
+
+            function connectWs() {
+                if (manuallyClosed) return;
+                try {
+                    ws = new WebSocket(wsUrl);
+                } catch (e) {
+                    console.error(e);
+                    scheduleReconnect();
+                    return;
+                }
+                ws.onopen = () => {
+                    reconnectDelayMs = 500;
+                    console.info('ws connected');
+                };
+                ws.onmessage = (ev) => {
+                    try { addItem(ev.data); } catch (e) { console.error(e); }
+                };
+                ws.onerror = () => {
+                    // Most browsers also emit onclose; close() forces a clean state.
+                    try { ws.close(); } catch {}
+                };
+                ws.onclose = () => {
+                    scheduleReconnect();
+                };
+            }
+
+            addEventListener('beforeunload', () => {
+                manuallyClosed = true;
+                if (reconnectTimer != null) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+                try { ws?.close(); } catch {}
+            });
+
+            connectWs();
 
             function addItem(text) {
                 // If message is JSON array, expand into multiple tiles and update chart

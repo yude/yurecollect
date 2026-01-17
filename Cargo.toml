@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
